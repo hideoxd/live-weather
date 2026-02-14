@@ -1,6 +1,8 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import dynamic from 'next/dynamic';
+import Image from 'next/image';
 import {
     Search,
     MapPin,
@@ -39,8 +41,6 @@ import {
     getPressureTrend,
     getDewPoint,
 } from '@/lib/weather-utils';
-import TemperatureChart from '@/components/charts/TemperatureChart';
-import PrecipitationChart from '@/components/charts/PrecipitationChart';
 
 const DEFAULT_CITIES: CityInfo[] = [
     { name: 'London', country: 'GB', lat: 51.5074, lon: -0.1278 },
@@ -49,6 +49,22 @@ const DEFAULT_CITIES: CityInfo[] = [
     { name: 'Mumbai', country: 'IN', lat: 19.076, lon: 72.8777 },
     { name: 'Dubai', country: 'AE', lat: 25.2048, lon: 55.2708 },
 ];
+
+const TemperatureChart = dynamic(() => import('@/components/charts/TemperatureChart'), {
+    ssr: false,
+    loading: () => <div className="chart-skeleton" />,
+});
+
+const PrecipitationChart = dynamic(() => import('@/components/charts/PrecipitationChart'), {
+    ssr: false,
+    loading: () => <div className="chart-skeleton" />,
+});
+
+const MONO_VALUE_STYLE = {
+    fontSize: 15,
+    fontWeight: 700,
+    fontFamily: 'var(--font-mono)',
+} as const;
 
 export default function WeatherDashboard() {
     const [cities, setCities] = useState<CityInfo[]>(DEFAULT_CITIES);
@@ -61,12 +77,67 @@ export default function WeatherDashboard() {
     const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
     const [showSearch, setShowSearch] = useState(false);
 
-    const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const searchAbortRef = useRef<AbortController | null>(null);
     const searchContainerRef = useRef<HTMLDivElement>(null);
+    const weatherCacheRef = useRef<Record<string, WeatherData>>({});
+    const inFlightWeatherRef = useRef<Set<string>>(new Set());
 
-    const activeCity = cities[activeCityIndex];
+    const activeCity = cities[activeCityIndex] ?? cities[0];
     const cacheKey = `${activeCity.lat},${activeCity.lon},${unit}`;
     const weatherData = weatherCache[cacheKey];
+
+    useEffect(() => {
+        weatherCacheRef.current = weatherCache;
+    }, [weatherCache]);
+
+    const {
+        hourlyData,
+        dailyData,
+        aqiInfo,
+        sunPosition,
+        dewPoint,
+        tempRangeMin,
+        tempRangeSpan,
+    } = useMemo(() => {
+        if (!weatherData) {
+            return {
+                hourlyData: [],
+                dailyData: [],
+                aqiInfo: { label: 'N/A', color: '#64748b' },
+                sunPosition: 0,
+                dewPoint: 0,
+                tempRangeMin: 0,
+                tempRangeSpan: 1,
+            };
+        }
+
+        const { current, forecast, airQuality, hourlyDetailed } = weatherData;
+        const computedHourly =
+            hourlyDetailed && hourlyDetailed.length > 0
+                ? hourlyDetailed
+                : getHourlyForecasts(forecast.list, 8);
+        const computedDaily = getDailyForecasts(forecast.list);
+        const computedAqi = airQuality.list[0]
+            ? getAQILabel(airQuality.list[0].main.aqi)
+            : { label: 'N/A', color: '#64748b' };
+        const computedSunPosition = getSunPosition(current.sys.sunrise, current.sys.sunset, current.dt);
+        const computedDewPoint = getDewPoint(current.main.temp, current.main.humidity);
+
+        const allTemps = computedDaily.flatMap((d) => [d.main.temp_min, d.main.temp_max]);
+        const min = allTemps.length > 0 ? Math.min(...allTemps) : 0;
+        const max = allTemps.length > 0 ? Math.max(...allTemps) : 0;
+
+        return {
+            hourlyData: computedHourly,
+            dailyData: computedDaily,
+            aqiInfo: computedAqi,
+            sunPosition: computedSunPosition,
+            dewPoint: computedDewPoint,
+            tempRangeMin: min,
+            tempRangeSpan: Math.max(1, max - min),
+        };
+    }, [weatherData]);
 
     // === DYNAMIC WEATHER THEME SYSTEM ===
     useEffect(() => {
@@ -172,13 +243,14 @@ export default function WeatherDashboard() {
     const fetchWeather = useCallback(
         async (city: CityInfo) => {
             const key = `${city.lat},${city.lon},${unit}`;
-            if (weatherCache[key]) {
+            if (weatherCacheRef.current[key] || inFlightWeatherRef.current.has(key)) {
                 setLoading(false);
                 return;
             }
 
             setLoading(true);
             setError(null);
+            inFlightWeatherRef.current.add(key);
 
             try {
                 const res = await fetch(
@@ -190,14 +262,20 @@ export default function WeatherDashboard() {
                     throw new Error(data.error || 'Failed to fetch weather data');
                 }
 
-                setWeatherCache((prev) => ({ ...prev, [key]: data }));
+                setWeatherCache((prev) => {
+                    if (prev[key]) return prev;
+                    const nextCache = { ...prev, [key]: data };
+                    weatherCacheRef.current = nextCache;
+                    return nextCache;
+                });
             } catch (err) {
                 setError(err instanceof Error ? err.message : 'Unknown error');
             } finally {
+                inFlightWeatherRef.current.delete(key);
                 setLoading(false);
             }
         },
-        [unit, weatherCache]
+        [unit]
     );
 
     useEffect(() => {
@@ -207,20 +285,64 @@ export default function WeatherDashboard() {
 
     // Prefetch weather for all cities
     useEffect(() => {
-        cities.forEach((city) => {
-            const key = `${city.lat},${city.lon},${unit}`;
-            if (!weatherCache[key]) {
-                fetch(`/api/weather?lat=${city.lat}&lon=${city.lon}&units=${unit}`)
-                    .then((res) => res.json())
-                    .then((data) => {
-                        if (data.current) {
-                            setWeatherCache((prev) => ({ ...prev, [key]: data }));
-                        }
-                    })
-                    .catch(() => { });
-            }
-        });
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        let cancelled = false;
+
+        const prefetchWeather = async () => {
+            const missingCities = cities.filter((city) => {
+                const key = `${city.lat},${city.lon},${unit}`;
+                return !weatherCacheRef.current[key] && !inFlightWeatherRef.current.has(key);
+            });
+
+            if (missingCities.length === 0) return;
+
+            const results = await Promise.all(
+                missingCities.map(async (city) => {
+                    const key = `${city.lat},${city.lon},${unit}`;
+                    inFlightWeatherRef.current.add(key);
+
+                    try {
+                        const res = await fetch(`/api/weather?lat=${city.lat}&lon=${city.lon}&units=${unit}`);
+                        const data = await res.json();
+                        if (!res.ok || !data.current) return null;
+                        return { key, data: data as WeatherData };
+                    } catch {
+                        return null;
+                    } finally {
+                        inFlightWeatherRef.current.delete(key);
+                    }
+                })
+            );
+
+            if (cancelled) return;
+
+            const validResults = results.filter((entry): entry is { key: string; data: WeatherData } => Boolean(entry));
+            if (validResults.length === 0) return;
+
+            setWeatherCache((prev) => {
+                let changed = false;
+                const next = { ...prev };
+
+                for (const { key, data } of validResults) {
+                    if (!next[key]) {
+                        next[key] = data;
+                        changed = true;
+                    }
+                }
+
+                if (changed) {
+                    weatherCacheRef.current = next;
+                    return next;
+                }
+
+                return prev;
+            });
+        };
+
+        prefetchWeather();
+
+        return () => {
+            cancelled = true;
+        };
     }, [cities, unit]);
 
     // Search cities
@@ -234,21 +356,40 @@ export default function WeatherDashboard() {
             clearTimeout(searchTimeoutRef.current);
         }
 
+        if (searchAbortRef.current) {
+            searchAbortRef.current.abort();
+        }
+
         searchTimeoutRef.current = setTimeout(async () => {
+            const controller = new AbortController();
+            searchAbortRef.current = controller;
+
             try {
-                const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
+                const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`, {
+                    signal: controller.signal,
+                });
                 const data = await res.json();
                 if (Array.isArray(data)) {
                     setSearchResults(data);
                 }
-            } catch {
+            } catch (err) {
+                if (err instanceof DOMException && err.name === 'AbortError') {
+                    return;
+                }
                 // silently fail
+            } finally {
+                if (searchAbortRef.current === controller) {
+                    searchAbortRef.current = null;
+                }
             }
         }, 300);
 
         return () => {
             if (searchTimeoutRef.current) {
                 clearTimeout(searchTimeoutRef.current);
+            }
+            if (searchAbortRef.current) {
+                searchAbortRef.current.abort();
             }
         };
     }, [searchQuery]);
@@ -348,20 +489,7 @@ export default function WeatherDashboard() {
 
     if (!weatherData) return null;
 
-    const { current, forecast, airQuality, hourlyDetailed } = weatherData;
-    const hourlyData = hourlyDetailed && hourlyDetailed.length > 0 ? hourlyDetailed : getHourlyForecasts(forecast.list, 8);
-    const dailyData = getDailyForecasts(forecast.list);
-    const aqiInfo = airQuality.list[0]
-        ? getAQILabel(airQuality.list[0].main.aqi)
-        : { label: 'N/A', color: '#64748b' };
-
-    const sunPosition = getSunPosition(current.sys.sunrise, current.sys.sunset, current.dt);
-    const dewPoint = getDewPoint(current.main.temp, current.main.humidity);
-
-    // Calculate temp range for daily forecast bars
-    const allTemps = dailyData.flatMap((d) => [d.main.temp_min, d.main.temp_max]);
-    const tempRangeMin = Math.min(...allTemps);
-    const tempRangeMax = Math.max(...allTemps);
+    const { current, forecast, airQuality } = weatherData;
 
     return (
         <>
@@ -457,10 +585,13 @@ export default function WeatherDashboard() {
                                     </span>
                                 )}
                                 {cityWeather && (
-                                    <img
+                                    <Image
                                         src={getWeatherIconUrl(cityWeather.current.weather[0].icon)}
-                                        alt=""
-                                        style={{ width: 28, height: 28 }}
+                                        alt={`${city.name} weather icon`}
+                                        width={28}
+                                        height={28}
+                                        sizes="28px"
+                                        loading="lazy"
                                     />
                                 )}
                                 {cities.length > 1 && (
@@ -516,9 +647,13 @@ export default function WeatherDashboard() {
 
                         <div className="current-weather-main">
                             <div className="weather-icon-large">
-                                <img
+                                <Image
                                     src={getWeatherIconUrl(current.weather[0].icon)}
                                     alt={current.weather[0].description}
+                                    width={140}
+                                    height={140}
+                                    sizes="140px"
+                                    priority
                                 />
                             </div>
                             <div className="temp-section">
@@ -615,9 +750,13 @@ export default function WeatherDashboard() {
                                                 : formatTime(item.dt, forecast.city.timezone)}
                                         </span>
                                         <div className="hourly-icon">
-                                            <img
+                                            <Image
                                                 src={getWeatherIconUrl(item.weather[0].icon)}
                                                 alt={item.weather[0].description}
+                                                width={32}
+                                                height={32}
+                                                sizes="32px"
+                                                loading="lazy"
                                             />
                                         </div>
                                         <span className="hourly-temp">
@@ -775,18 +914,22 @@ export default function WeatherDashboard() {
                                 <Thermometer size={18} className="icon" style={{ color: '#f97316' }} />
                                 5-Day Forecast
                             </div>
-                            {dailyData.map((day, i) => {
+                            {dailyData.map((day) => {
                                 const barLeft =
-                                    ((day.main.temp_min - tempRangeMin) / (tempRangeMax - tempRangeMin)) * 100;
+                                    ((day.main.temp_min - tempRangeMin) / tempRangeSpan) * 100;
                                 const barWidth =
-                                    ((day.main.temp_max - day.main.temp_min) / (tempRangeMax - tempRangeMin)) * 100;
+                                    ((day.main.temp_max - day.main.temp_min) / tempRangeSpan) * 100;
                                 return (
-                                    <div key={i} className="daily-item">
+                                    <div key={day.dt} className="daily-item">
                                         <span className="daily-day">{formatDay(day.dt)}</span>
                                         <div className="daily-icon">
-                                            <img
+                                            <Image
                                                 src={getWeatherIconUrl(day.weather[0].icon)}
                                                 alt={day.weather[0].description}
+                                                width={36}
+                                                height={36}
+                                                sizes="36px"
+                                                loading="lazy"
                                             />
                                         </div>
                                         <span className="daily-desc">{day.weather[0].description}</span>
@@ -877,25 +1020,25 @@ export default function WeatherDashboard() {
                             <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 12 }}>
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <span style={{ fontSize: 13, color: '#94a3b8' }}>Sea Level</span>
-                                    <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    <span style={MONO_VALUE_STYLE}>
                                         {current.main.sea_level || current.main.pressure} hPa
                                     </span>
                                 </div>
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <span style={{ fontSize: 13, color: '#94a3b8' }}>Ground Level</span>
-                                    <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    <span style={MONO_VALUE_STYLE}>
                                         {current.main.grnd_level || '—'} hPa
                                     </span>
                                 </div>
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <span style={{ fontSize: 13, color: '#94a3b8' }}>Dew Point</span>
-                                    <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    <span style={MONO_VALUE_STYLE}>
                                         {formatTemp(dewPoint, unit)}
                                     </span>
                                 </div>
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <span style={{ fontSize: 13, color: '#94a3b8' }}>Cloudiness</span>
-                                    <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    <span style={MONO_VALUE_STYLE}>
                                         {current.clouds.all}%
                                     </span>
                                 </div>

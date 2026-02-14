@@ -3,6 +3,10 @@ import { getWMODescription, getWMOIcon, getWMOMain, getWMOWeatherId } from '@/li
 
 const OPEN_METEO_URL = 'https://api.open-meteo.com/v1/forecast';
 const AIR_QUALITY_URL = 'https://air-quality-api.open-meteo.com/v1/air-quality';
+const WEATHER_CACHE_HEADERS = {
+  'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=1200',
+};
+const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' };
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
@@ -13,7 +17,17 @@ export async function GET(request: NextRequest) {
   if (!lat || !lon) {
     return NextResponse.json(
       { error: 'Please provide coordinates (lat & lon)' },
-      { status: 400 }
+      { status: 400, headers: NO_STORE_HEADERS }
+    );
+  }
+
+  const latNum = Number(lat);
+  const lonNum = Number(lon);
+
+  if (!Number.isFinite(latNum) || !Number.isFinite(lonNum)) {
+    return NextResponse.json(
+      { error: 'Invalid coordinates provided' },
+      { status: 400, headers: NO_STORE_HEADERS }
     );
   }
 
@@ -34,12 +48,14 @@ export async function GET(request: NextRequest) {
         `&wind_speed_unit=${windUnit}` +
         `&precipitation_unit=mm` +
         `&timezone=auto` +
-        `&forecast_days=6`
+        `&forecast_days=6`,
+        { next: { revalidate: 600 } }
       ),
       fetch(
         `${AIR_QUALITY_URL}?` +
         `latitude=${lat}&longitude=${lon}` +
-        `&current=european_aqi,us_aqi,pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,ammonia`
+        `&current=european_aqi,us_aqi,pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,ammonia`,
+        { next: { revalidate: 600 } }
       ),
     ]);
 
@@ -48,7 +64,7 @@ export async function GET(request: NextRequest) {
       console.error('Open-Meteo weather error:', errText);
       return NextResponse.json(
         { error: 'Failed to fetch weather data from Open-Meteo' },
-        { status: weatherRes.status }
+        { status: weatherRes.status, headers: NO_STORE_HEADERS }
       );
     }
 
@@ -56,14 +72,14 @@ export async function GET(request: NextRequest) {
     const aqData = aqRes.ok ? await aqRes.json() : null;
 
     // Transform Open-Meteo data into our internal format (compatible with frontend)
-    const transformed = transformWeatherData(weatherData, aqData, Number(lat), Number(lon), isImperial);
+    const transformed = transformWeatherData(weatherData, aqData, latNum, lonNum, isImperial);
 
-    return NextResponse.json(transformed);
+    return NextResponse.json(transformed, { headers: WEATHER_CACHE_HEADERS });
   } catch (error) {
     console.error('Weather API error:', error);
     return NextResponse.json(
       { error: 'Failed to fetch weather data' },
-      { status: 500 }
+      { status: 500, headers: NO_STORE_HEADERS }
     );
   }
 }

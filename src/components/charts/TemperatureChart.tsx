@@ -1,5 +1,7 @@
 'use client';
 
+import { memo, useMemo } from 'react';
+
 import {
     AreaChart,
     Area,
@@ -17,36 +19,46 @@ interface TemperatureChartProps {
     timezone: number;
 }
 
-export default function TemperatureChart({ data, timezone }: TemperatureChartProps) {
-    const chartData = data.slice(0, 12).map((item) => {
-        const date = new Date((item.dt + timezone) * 1000);
-        return {
-            time: date.toLocaleTimeString('en-US', {
-                hour: 'numeric',
-                hour12: true,
-                timeZone: 'UTC',
-            }),
-            temp: Math.round(item.main.temp),
-            feels: Math.round(item.main.feels_like),
-            humidity: item.main.humidity,
-        };
-    });
+interface ChartTooltipProps {
+    active?: boolean;
+    payload?: Array<{ value: number; dataKey: string }>;
+    label?: string;
+}
 
-    const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number; dataKey: string }>; label?: string }) => {
-        if (active && payload && payload.length) {
-            return (
-                <div className="custom-tooltip">
-                    <p className="label">{label}</p>
-                    {payload.map((entry, index) => (
-                        <p key={index} className="value" style={{ color: entry.dataKey === 'temp' ? '#3b82f6' : '#8b5cf6' }}>
-                            {entry.dataKey === 'temp' ? 'Temp' : 'Feels'}: {formatTempShort(entry.value)}
-                        </p>
-                    ))}
-                </div>
-            );
-        }
-        return null;
-    };
+const TemperatureTooltip = memo(function TemperatureTooltip({ active, payload, label }: ChartTooltipProps) {
+    if (active && payload && payload.length) {
+        return (
+            <div className="custom-tooltip">
+                <p className="label">{label}</p>
+                {payload.map((entry, index) => (
+                    <p key={index} className="value" style={{ color: entry.dataKey === 'temp' ? '#3b82f6' : '#8b5cf6' }}>
+                        {entry.dataKey === 'temp' ? 'Temp' : 'Feels'}: {formatTempShort(entry.value)}
+                    </p>
+                ))}
+            </div>
+        );
+    }
+    return null;
+});
+
+function TemperatureChart({ data, timezone }: TemperatureChartProps) {
+    const chartData = useMemo(
+        () =>
+            data.slice(0, 12).map((item) => {
+                const date = new Date((item.dt + timezone) * 1000);
+                return {
+                    time: date.toLocaleTimeString('en-US', {
+                        hour: 'numeric',
+                        hour12: true,
+                        timeZone: 'UTC',
+                    }),
+                    temp: Math.round(item.main.temp),
+                    feels: Math.round(item.main.feels_like),
+                    humidity: item.main.humidity,
+                };
+            }),
+        [data, timezone]
+    );
 
     return (
         <ResponsiveContainer width="100%" height={250}>
@@ -76,7 +88,7 @@ export default function TemperatureChart({ data, timezone }: TemperatureChartPro
                     axisLine={false}
                     tickFormatter={(val) => `${val}°`}
                 />
-                <Tooltip content={<CustomTooltip />} />
+                <Tooltip content={<TemperatureTooltip />} />
                 <Area
                     type="monotone"
                     dataKey="temp"
@@ -100,3 +112,5 @@ export default function TemperatureChart({ data, timezone }: TemperatureChartPro
         </ResponsiveContainer>
     );
 }
+
+export default memo(TemperatureChart);
